@@ -7,12 +7,24 @@ export interface UserSession {
   sessionId: string | undefined;
   workingDirectory: string;
   lastUsed: number;
+  /** Cumulative token usage across all queries in this session */
+  cumulativeTokens: number;
+  /** Cumulative cost (USD) across all queries in this session */
+  cumulativeCostUsd: number;
+  /** Cumulative duration (ms) across all queries in this session */
+  cumulativeDurationMs: number;
+  /** Per-session model override (e.g. "claude-opus-4-7"). Falls back to bot default when undefined. */
+  model?: string;
 }
 
 interface PersistedSession {
   sessionId: string;
   workingDirectory: string;
   lastUsed: number;
+  cumulativeTokens?: number;
+  cumulativeCostUsd?: number;
+  cumulativeDurationMs?: number;
+  model?: string;
 }
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -51,6 +63,9 @@ export class SessionManager {
         sessionId: undefined,
         workingDirectory: this.defaultWorkingDirectory,
         lastUsed: Date.now(),
+        cumulativeTokens: 0,
+        cumulativeCostUsd: 0,
+        cumulativeDurationMs: 0,
       };
       this.sessions.set(chatId, session);
     }
@@ -80,10 +95,30 @@ export class SessionManager {
     this.saveToDisk();
   }
 
+  /** Set per-session model override. Pass undefined to clear. */
+  setSessionModel(chatId: string, model: string | undefined): void {
+    const session = this.getSession(chatId);
+    session.model = model;
+    this.logger.info({ chatId, model }, 'Session model override updated');
+    this.saveToDisk();
+  }
+
+  /** Accumulate token/cost/duration from a completed query into the session totals. */
+  addUsage(chatId: string, tokens: number, costUsd: number, durationMs: number): void {
+    const session = this.getSession(chatId);
+    session.cumulativeTokens += tokens;
+    session.cumulativeCostUsd += costUsd;
+    session.cumulativeDurationMs += durationMs;
+    this.saveToDisk();
+  }
+
   resetSession(chatId: string): void {
     const session = this.sessions.get(chatId);
     if (session) {
       session.sessionId = undefined;
+      session.cumulativeTokens = 0;
+      session.cumulativeCostUsd = 0;
+      session.cumulativeDurationMs = 0;
       // Keep working directory
       this.logger.info({ chatId }, 'Session reset');
       this.saveToDisk();
@@ -109,12 +144,16 @@ export class SessionManager {
     try {
       const data: Record<string, PersistedSession> = {};
       for (const [chatId, session] of this.sessions) {
-        // Only persist sessions that have a sessionId (active Claude sessions)
-        if (session.sessionId) {
+        // Persist sessions that have either a sessionId or a model override
+        if (session.sessionId || session.model) {
           data[chatId] = {
-            sessionId: session.sessionId,
+            sessionId: session.sessionId || '',
             workingDirectory: session.workingDirectory,
             lastUsed: session.lastUsed,
+            cumulativeTokens: session.cumulativeTokens,
+            cumulativeCostUsd: session.cumulativeCostUsd,
+            cumulativeDurationMs: session.cumulativeDurationMs,
+            model: session.model,
           };
         }
       }
@@ -135,9 +174,13 @@ export class SessionManager {
         // Skip expired sessions
         if (now - persisted.lastUsed > SESSION_TTL_MS) continue;
         this.sessions.set(chatId, {
-          sessionId: persisted.sessionId,
+          sessionId: persisted.sessionId || undefined,
           workingDirectory: persisted.workingDirectory,
           lastUsed: persisted.lastUsed,
+          cumulativeTokens: persisted.cumulativeTokens ?? 0,
+          cumulativeCostUsd: persisted.cumulativeCostUsd ?? 0,
+          cumulativeDurationMs: persisted.cumulativeDurationMs ?? 0,
+          model: persisted.model,
         });
         loaded++;
       }

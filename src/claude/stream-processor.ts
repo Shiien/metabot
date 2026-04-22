@@ -39,13 +39,16 @@ export class StreamProcessor {
   private durationMs: number | undefined;
   private numTurns: number | undefined;
   private _imagePaths: Set<string> = new Set();
-  private _pendingQuestion: PendingQuestion | null = null;
+  private _pendingQuestions: PendingQuestion[] = [];
   private _autoRespondTools: AutoRespondTool[] = [];
   private _planFilePath: string | null = null;
   private _config: StreamProcessorConfig;
   private _model: string | undefined;
   private _totalTokens: number | undefined;
   private _contextWindow: number | undefined;
+  // Track per-API-call usage from stream events for accurate context window display
+  private _lastInputTokens: number | undefined;
+  private _lastOutputTokens: number | undefined;
 
   constructor(
     private userPrompt: string,
@@ -102,7 +105,7 @@ export class StreamProcessor {
 
     // Determine running status
     const hasActiveTools = this.toolCalls.some((t) => t.status === 'running');
-    const status = this._pendingQuestion
+    const status = this._pendingQuestions.length > 0
       ? 'waiting_for_input'
       : hasActiveTools ? 'running' : this.responseText ? 'running' : 'thinking';
 
@@ -117,7 +120,7 @@ export class StreamProcessor {
       startTime: this._config.startTime,
       costUsd: this.costUsd,
       durationMs: this.durationMs,
-      pendingQuestion: this._pendingQuestion || undefined,
+      pendingQuestion: this._pendingQuestions[0] || undefined,
       model: this._config.model,
       thinking: this._config.thinking,
       effort: this._config.effort,
@@ -214,6 +217,22 @@ export class StreamProcessor {
   private processStreamEvent(message: SDKMessage): void {
     const event = message.event;
     if (!event) return;
+
+    // Track message_start/message_delta from ALL levels (not just top-level)
+    // because these carry per-API-call token usage needed for context display
+    if (event.type === 'message_start') {
+      const usage = (event as any).message?.usage;
+      if (usage) {
+        this._lastInputTokens = (usage.input_tokens ?? 0)
+          + (usage.cache_read_input_tokens ?? 0)
+          + (usage.cache_creation_input_tokens ?? 0);
+      }
+    } else if (event.type === 'message_delta') {
+      const usage = (event as any).usage;
+      if (usage?.output_tokens != null) {
+        this._lastOutputTokens = usage.output_tokens;
+      }
+    }
 
     // Handle subagent stream events
     if (message.parent_tool_use_id !== null && message.parent_tool_use_id !== undefined) {
@@ -345,12 +364,18 @@ export class StreamProcessor {
         const mu = message.modelUsage[primaryModel];
         this._model = primaryModel;
         this._contextWindow = mu.contextWindow;
-        // Sum tokens across all models
-        let totalTokens = 0;
-        for (const m of models) {
-          totalTokens += (message.modelUsage![m].inputTokens ?? 0) + (message.modelUsage![m].outputTokens ?? 0);
+        // Use last API call's tokens from stream events (accurate context window occupation)
+        // Falls back to cumulative modelUsage input+output if stream events weren't captured
+        if (this._lastInputTokens != null) {
+          this._totalTokens = this._lastInputTokens + (this._lastOutputTokens ?? 0);
+        } else {
+          let totalTokens = 0;
+          for (const m of models) {
+            totalTokens += (message.modelUsage![m].inputTokens ?? 0);
+            totalTokens += (message.modelUsage![m].outputTokens ?? 0);
+          }
+          this._totalTokens = totalTokens;
         }
-        this._totalTokens = totalTokens;
       }
     }
 
@@ -443,15 +468,18 @@ export class StreamProcessor {
       multiSelect: Boolean(q.multiSelect),
     }));
 
-    this._pendingQuestion = { toolUseId, questions: parsed };
+    // Queue instead of overwrite — supports multiple AskUserQuestion calls
+    this._pendingQuestions.push({ toolUseId, questions: parsed });
   }
 
+  /** Remove the first pending question (after it's been fully answered). */
   clearPendingQuestion(): void {
-    this._pendingQuestion = null;
+    this._pendingQuestions.shift();
   }
 
+  /** Peek at the first pending question without removing it. */
   getPendingQuestion(): PendingQuestion | null {
-    return this._pendingQuestion;
+    return this._pendingQuestions[0] ?? null;
   }
 
   /**
@@ -465,6 +493,31 @@ export class StreamProcessor {
     this._autoRespondTools = [];
     return tools;
   }
+
+  /** Return the current card state without processing a new message. */
+  getCurrentState(): CardState {
+    const hasActiveTools = this.toolCalls.some((t) => t.status === 'running');
+    const status = this._pendingQuestions.length > 0
+      ? 'waiting_for_input'
+      : hasActiveTools ? 'running' : this.responseText ? 'running' : 'thinking';
+    return {
+      status,
+      userPrompt: this.userPrompt,
+      responseText: this.responseText,
+      thinkingText: this.thinkingText || undefined,
+      toolCalls: [...this.toolCalls],
+      costUsd: this.costUsd,
+      durationMs: this.durationMs,
+      pendingQuestion: this._pendingQuestions[0] || undefined,
+      model: this._config.model,
+      thinking: this._config.thinking,
+      effort: this._config.effort,
+      sessionId: this.sessionId,
+      workingDirectory: this.workingDirectory,
+      numTurns: this.numTurns,
+    };
+  }
+
 
   getSessionId(): string | undefined {
     return this.sessionId;

@@ -95,15 +95,17 @@ export function createEventDispatcher(
         const messageId = message.message_id;
 
         // In group chats, only respond when the bot is @mentioned
-        // Exception: 2-member groups (1 user + 1 bot) are treated like DMs
+        // Exceptions: 2-member groups are treated like DMs; groupNoMention mode skips @mention check
         const mentions = message.mentions;
         if (chatType === 'group') {
           const botMentioned = mentions?.some(
             (m: any) => !botOpenId || m.id?.open_id === botOpenId,
           );
           if (!botMentioned) {
-            // Check if this is a private-like group (only 2 members)
-            if (messageSender && await isPrivateLikeGroup(chatId, messageSender)) {
+            // groupNoMention mode: respond to all messages without @mention
+            if (config.groupNoMention) {
+              logger.debug({ chatId }, 'Group no-mention mode enabled, processing without @mention');
+            } else if (messageSender && await isPrivateLikeGroup(chatId, messageSender)) {
               logger.debug({ chatId }, 'Private-like group (2 members), processing without @mention');
             } else if (msgType === 'image' || msgType === 'file') {
               // Cache media messages for later retrieval when user @mentions bot
@@ -127,6 +129,7 @@ export function createEventDispatcher(
         let imageKey: string | undefined;
         let fileKey: string | undefined;
         let fileName: string | undefined;
+        let postExtraImages: string[] = [];
 
         if (msgType === 'image') {
           // Image message: extract image_key
@@ -165,8 +168,12 @@ export function createEventDispatcher(
             const content = JSON.parse(message.content);
             logger.debug({ postContent: JSON.stringify(content).slice(0, 500) }, 'Raw post content');
             text = extractTextFromPost(content);
-            imageKey = extractImageFromPost(content);
-            logger.debug({ extractedText: text.slice(0, 200), imageKey }, 'Extracted post content');
+            const postImages = extractImagesFromPost(content);
+            if (postImages.length > 0) {
+              imageKey = postImages[0];
+              postExtraImages = postImages.slice(1);
+            }
+            logger.debug({ extractedText: text.slice(0, 200), imageKey, postImageCount: postImages.length }, 'Extracted post content');
           } catch {
             logger.warn({ content: message.content }, 'Failed to parse post message content');
             return;
@@ -203,17 +210,25 @@ export function createEventDispatcher(
           logger.info({ userId, chatId, chatType, text: text.slice(0, 100), imageKey }, 'Received message');
         }
 
-        // In group chats, attach any cached media from this user
+        // Collect extra media: post images (2nd+) and cached group media
         let extraMedia: IncomingMessage['extraMedia'];
+        if (postExtraImages.length > 0) {
+          extraMedia = postExtraImages.map(key => ({
+            messageId,
+            imageKey: key,
+          }));
+          logger.info({ chatId, postExtraImageCount: postExtraImages.length }, 'Attached extra images from post');
+        }
         if (chatType === 'group') {
           const cached = getCachedMedia(chatId, userId);
           if (cached.length > 0) {
-            extraMedia = cached.map(m => ({
+            const cachedMedia = cached.map(m => ({
               messageId: m.messageId,
               imageKey: m.imageKey,
               fileKey: m.fileKey,
               fileName: m.fileName,
             }));
+            extraMedia = extraMedia ? [...extraMedia, ...cachedMedia] : cachedMedia;
             clearCachedMedia(chatId, userId);
             logger.info({ chatId, userId, mediaCount: cached.length }, 'Attached cached media to @mention message');
           }
@@ -251,10 +266,10 @@ function parseMediaMessage(
 }
 
 /**
- * Extract the first image_key from a Feishu post (rich text) message.
+ * Extract all image_keys from a Feishu post (rich text) message.
  * Looks for { tag: "img", image_key: "..." } elements in the post content.
  */
-function extractImageFromPost(content: Record<string, unknown>): string | undefined {
+function extractImagesFromPost(content: Record<string, unknown>): string[] {
   const bodies: Array<Record<string, unknown>> = [];
 
   if (Array.isArray(content.content)) {
@@ -270,6 +285,7 @@ function extractImageFromPost(content: Record<string, unknown>): string | undefi
     }
   }
 
+  const keys: string[] = [];
   for (const body of bodies) {
     const paragraphs = body.content as unknown[][];
     for (const paragraph of paragraphs) {
@@ -278,13 +294,13 @@ function extractImageFromPost(content: Record<string, unknown>): string | undefi
         if (!element || typeof element !== 'object') continue;
         const el = element as Record<string, unknown>;
         if (el.tag === 'img' && typeof el.image_key === 'string') {
-          return el.image_key;
+          keys.push(el.image_key);
         }
       }
     }
   }
 
-  return undefined;
+  return keys;
 }
 
 /**

@@ -35,6 +35,20 @@ mb schedule cron <bot> <chatId> '<cronExpr>' <prompt>  # Create recurring task
 mb schedule pause <id>                     # Pause a recurring task
 mb schedule resume <id>                    # Resume a paused recurring task
 
+# Voice Call (RTC — real-time Doubao AI)
+mb voice call <bot> <chatId> [prompt]      # Start voice call, wait for transcript
+mb voice transcript <sessionId>            # Get call transcript
+mb voice list                              # List active voice sessions
+mb voice config                            # Check RTC configuration
+
+# Skill Hub (cross-bot skill sharing)
+mb skills                                  # List all shared skills (local + peer)
+mb skills search <query>                   # Search skills by keyword
+mb skills get <name>                       # Get skill details
+mb skills publish <botName> <skillName>    # Publish a bot's skill to the hub
+mb skills install <skillName> <botName>    # Install a skill to a bot
+mb skills remove <name>                    # Unpublish a skill
+
 # Monitoring
 mb stats                                   # Cost & usage stats (per-bot, per-user)
 mb metrics                                 # Prometheus metrics

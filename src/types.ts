@@ -44,7 +44,7 @@ export interface CardState {
   errorMessage?: string;
   retryInfo?: string;
   pendingQuestion?: PendingQuestion;
-  /** Primary model used (e.g. "claude-opus-4-6") */
+  /** Primary model used (e.g. "claude-opus-4-7") */
   model?: string;
   thinking?: string;
   effort?: string;
@@ -55,6 +55,8 @@ export interface CardState {
   totalTokens?: number;
   /** Context window size of the primary model */
   contextWindow?: number;
+  /** Cumulative session cost (USD), accumulated across queries until /reset */
+  sessionCostUsd?: number;
 }
 
 export interface IncomingMessage {
