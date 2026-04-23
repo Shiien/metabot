@@ -2,7 +2,6 @@ import { execSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { SDKUserMessage, SpawnOptions, SpawnedProcess } from '@anthropic-ai/claude-agent-sdk';
 import type { BotConfigBase } from '../config.js';
@@ -51,8 +50,11 @@ function hasCredentialsFile(): boolean {
 }
 
 /**
- * Create a custom spawn function for cross-platform compatibility.
- * - Uses process.execPath (current Node binary) to avoid PATH issues on Windows.
+ * Create a custom spawn function that preserves env filtering while letting
+ * the SDK decide what to exec:
+ * - Honours `options.command` (the SDK resolves it to either the claude binary
+ *   or the node executable, depending on whether pathToClaudeCodeExecutable
+ *   is a JS file). On Windows, wrap .cmd/.bat shims with `shell: true`.
  * - Always filters CLAUDE* env vars to prevent nested session errors.
  * - Filters ANTHROPIC auth env vars only when an explicit API key is provided
  *   or credentials.json exists (so env-var-only users can still authenticate).
@@ -64,8 +66,6 @@ function createSpawnFn(explicitApiKey?: string): (options: SpawnOptions) => Spaw
   const filterAuthVars = !!(explicitApiKey || hasCredentialsFile());
 
   return (options: SpawnOptions): SpawnedProcess => {
-    const nodePath = process.execPath;
-
     // Merge provided env with process.env for a complete environment
     const baseEnv = options.env && Object.keys(options.env).length > 0
       ? { ...process.env, ...options.env }
@@ -85,11 +85,15 @@ function createSpawnFn(explicitApiKey?: string): (options: SpawnOptions) => Spaw
       env.ANTHROPIC_API_KEY = explicitApiKey;
     }
 
-    const child = spawn(nodePath, options.args, {
+    const command = (options as any).command as string | undefined ?? CLAUDE_EXECUTABLE;
+    const useShell = isWindows && /\.(cmd|bat)$/i.test(command);
+
+    const child = spawn(command, options.args, {
       cwd: options.cwd,
       env,
       signal: options.signal,
       stdio: ['pipe', 'pipe', 'pipe'],
+      shell: useShell,
     });
 
     return child as unknown as SpawnedProcess;
@@ -211,11 +215,9 @@ export class ClaudeExecutor {
       settingSources: ['user', 'project'],
       // Auto-approve all MCP servers from .mcp.json (SDK mode has no interactive approval)
       enableAllProjectMcpServers: true,
-      // Cross-platform spawn: custom spawn filters CLAUDE* env vars and uses
-      // process.execPath to avoid PATH issues on Windows; fileURLToPath converts
-      // file:// URLs to native paths for the SDK CLI entrypoint.
+      // Custom spawn: filters CLAUDE*/ANTHROPIC env vars (nested-session and
+      // auth collision fixes) while honouring options.command from the SDK.
       spawnClaudeCodeProcess: createSpawnFn(this.config.claude.apiKey),
-      executableArgs: [path.join(path.dirname(fileURLToPath(import.meta.resolve('@anthropic-ai/claude-agent-sdk'))), 'cli.js')],
       pathToClaudeCodeExecutable: CLAUDE_EXECUTABLE,
     };
 
