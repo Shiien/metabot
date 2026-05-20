@@ -1,10 +1,15 @@
 import type { IMessageSender } from '../bridge/message-sender.interface.js';
-import type { CardState, CardStatus } from '../types.js';
+import type { CardState } from '../types.js';
 import type { Logger } from '../utils/logger.js';
 import type { WechatClient } from './wechat-client.js';
 
 const MAX_TEXT_LENGTH = 4000;
-const PROGRESS_THROTTLE_MS = 5_000;
+/**
+ * Progress heartbeat throttle. WeChat can't edit messages, so every progress
+ * tick is a fresh text in the chat — keep it sparse. 30 s gives long-running
+ * tasks visible signal ("it's still going") without flooding the thread.
+ */
+const PROGRESS_THROTTLE_MS = 30_000;
 
 /**
  * WeChat implementation of IMessageSender.
@@ -39,13 +44,13 @@ export class WechatSender implements IMessageSender {
     return messageId;
   }
 
-  async updateCard(messageId: string, state: CardState): Promise<void> {
+  async updateCard(messageId: string, state: CardState): Promise<boolean> {
     const { chatId } = this.parseMessageId(messageId);
-    if (!chatId) return;
+    if (!chatId) return false;
 
     // Terminal states: send final result as standalone FINISH message
     if (state.status === 'complete' || state.status === 'error') {
-      if (this.finalSentSet.has(messageId)) return; // idempotency
+      if (this.finalSentSet.has(messageId)) return true; // idempotency — already delivered
       this.finalSentSet.add(messageId);
       this.lastProgressSent.delete(messageId);
       this.reportedToolCount.delete(messageId);
@@ -54,7 +59,7 @@ export class WechatSender implements IMessageSender {
       const text = this.renderFinalMessage(state);
       // Use sendText for automatic chunking of long responses
       await this.sendText(chatId, text);
-      return;
+      return true;
     }
 
     // Waiting for input: send question as standalone message
@@ -63,10 +68,15 @@ export class WechatSender implements IMessageSender {
       await this.client.sendTextMessage(chatId, text).catch((err) => {
         this.logger.error({ err, chatId }, 'Failed to send WeChat question');
       });
-      return;
+      return true;
     }
 
-    // Intermediate: send tool progress as actual messages (throttled)
+    // Intermediate: single-line heartbeat ("running... N tools"), throttled.
+    // Previous behavior dumped tool names + details for every new tool every
+    // 5 s — way too noisy. Now we emit at most one terse status line per
+    // PROGRESS_THROTTLE_MS, only when the tool count has grown since the
+    // last heartbeat, so long runs still show signs of life without flooding
+    // the chat.
     const now = Date.now();
     const lastProgress = this.lastProgressSent.get(messageId) || 0;
     const reported = this.reportedToolCount.get(messageId) || 0;
@@ -74,15 +84,14 @@ export class WechatSender implements IMessageSender {
 
     if (hasNewTools && now - lastProgress > PROGRESS_THROTTLE_MS) {
       this.lastProgressSent.set(messageId, now);
-      // Only report new tool calls since last update
-      const newTools = state.toolCalls.slice(reported);
       this.reportedToolCount.set(messageId, state.toolCalls.length);
 
-      const text = this.renderProgressMessage(newTools, state.status);
+      const text = this.renderHeartbeatMessage(state);
       await this.client.sendTextMessage(chatId, text).catch((err) => {
         this.logger.debug({ err, chatId }, 'Failed to send WeChat progress (may lack context_token)');
       });
     }
+    return true;
   }
 
   async sendTextNotice(chatId: string, title: string, content: string): Promise<void> {
@@ -143,19 +152,17 @@ export class WechatSender implements IMessageSender {
 
   // --- Rendering ---
 
-  /** Progress message for new tool calls since last update. */
-  private renderProgressMessage(newTools: CardState['toolCalls'], status: CardState['status']): string {
-    const parts: string[] = [];
-    const label = status === 'thinking' ? '🤔 思考中...' : '🔧 运行中...';
-    parts.push(label);
-
-    for (const t of newTools.slice(-5)) {
-      const icon = t.status === 'done' ? '✓' : '⏳';
-      const detail = t.detail.length > 80 ? t.detail.slice(0, 80) + '...' : t.detail;
-      parts.push(`${icon} ${t.name} ${detail}`);
-    }
-
-    return parts.join('\n');
+  /**
+   * Heartbeat message — single line, no per-tool details. Sent at most once
+   * per PROGRESS_THROTTLE_MS so the WeChat thread stays clean. Just enough
+   * signal to tell the user the bot hasn't died.
+   */
+  private renderHeartbeatMessage(state: CardState): string {
+    const label = state.status === 'thinking' ? '🤔 思考中' : '🔧 运行中';
+    const total = state.toolCalls.length;
+    if (total === 0) return label;
+    const last = state.toolCalls[state.toolCalls.length - 1];
+    return `${label}：${last.name} · ${total} tool${total > 1 ? 's' : ''}`;
   }
 
   /** Final message: just the response text (or error). */

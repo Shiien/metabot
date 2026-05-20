@@ -1,5 +1,12 @@
 // Re-export shared types so existing imports from this module continue to work
-export type { CardStatus, ToolCall, PendingQuestion, CardState, SubagentTask } from '../types.js';
+export type {
+  CardStatus,
+  ToolCall,
+  PendingQuestion,
+  CardState,
+  BackgroundEvent,
+  BackgroundTaskStatus,
+} from '../types.js';
 import type { CardState, CardStatus } from '../types.js';
 
 const STATUS_CONFIG: Record<CardStatus, { color: string; title: string; icon: string }> = {
@@ -8,137 +15,29 @@ const STATUS_CONFIG: Record<CardStatus, { color: string; title: string; icon: st
   complete: { color: 'green', title: 'Complete', icon: '🟢' },
   error: { color: 'red', title: 'Error', icon: '🔴' },
   waiting_for_input: { color: 'yellow', title: 'Waiting for Input', icon: '🟡' },
+  // Blue with a distinct title so users can tell a between-turn burst card
+  // apart from both a live "running" turn and a finished "complete" reply
+  // without reading body text. See message-bridge.flushSpontaneous.
+  agent_activity: { color: 'blue', title: 'Agent activity', icon: '🔵' },
 };
+
+const BG_ICON: Record<'running' | 'completed' | 'failed' | 'stopped', string> = {
+  running: '⏳',
+  completed: '✅',
+  failed: '❌',
+  stopped: '⏹️',
+};
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max) + '…';
+}
 
 const MAX_CONTENT_LENGTH = 28000;
 
-/**
- * Parse a Markdown table block into headers and rows.
- * Returns null if the text is not a valid Markdown table.
- */
-function parseMarkdownTable(block: string): { headers: string[]; rows: string[][] } | null {
-  const lines = block.trim().split('\n');
-  if (lines.length < 2) return null;
-
-  // Header row must contain pipes
-  const headerLine = lines[0].trim();
-  if (!headerLine.includes('|')) return null;
-
-  // Second line must be the separator (dashes and pipes)
-  const sepLine = lines[1].trim();
-  if (!/^[\s|:-]+$/.test(sepLine)) return null;
-
-  const parseCells = (line: string): string[] =>
-    line.replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
-
-  const headers = parseCells(headerLine);
-  if (headers.length === 0) return null;
-
-  const rows: string[][] = [];
-  for (let i = 2; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line || !line.includes('|')) continue;
-    rows.push(parseCells(line));
-  }
-
-  return { headers, rows };
-}
-
-/**
- * Strip Markdown formatting from text, leaving plain content.
- * Handles: **bold**, *italic*, `code`, ~~strike~~, [text](url)
- */
-function stripMarkdown(text: string): string {
-  return text
-    .replace(/\*\*(.+?)\*\*/g, '$1')   // **bold**
-    .replace(/\*(.+?)\*/g, '$1')        // *italic*
-    .replace(/~~(.+?)~~/g, '$1')        // ~~strike~~
-    .replace(/`(.+?)`/g, '$1')          // `code`
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1'); // [text](url)
-}
-
-/**
- * Convert a parsed Markdown table into a Feishu card table element.
- * Uses the Feishu card v2 table component with column_list and rows.
- */
-function buildFeishuTableElement(table: { headers: string[]; rows: string[][] }): unknown {
-  const columns = table.headers.map((h, i) => ({
-    name: `col_${i}`,
-    display_name: stripMarkdown(h),
-    data_type: 'lark_md' as const,
-    width: 'auto' as const,
-  }));
-
-  const rows = table.rows.map((row) => {
-    const obj: Record<string, string> = {};
-    table.headers.forEach((_, i) => {
-      obj[`col_${i}`] = stripMarkdown(row[i] ?? '');
-    });
-    return obj;
-  });
-
-  return {
-    tag: 'table',
-    page_size: rows.length,
-    row_height: 'low',
-    header_style: {
-      text_align: 'left',
-      text_size: 'normal',
-      background_style: 'grey',
-      bold: true,
-      lines: 1,
-    },
-    columns,
-    rows,
-  };
-}
-
-/**
- * Split Markdown text into segments: plain markdown and table elements.
- * Tables are detected and converted to Feishu card table components.
- * Returns an array of card elements (markdown or table).
- */
-function splitMarkdownWithTables(text: string): unknown[] {
-  const elements: unknown[] = [];
-
-  // Match table blocks: lines starting with | that include a separator row
-  const tableRegex = /(?:^|\n)((?:\|[^\n]+\|?\n)(?:\|[\s:|-]+\|?\n)(?:(?:\|[^\n]+\|?\n?)*))/g;
-  let lastIndex = 0;
-
-  for (const match of text.matchAll(tableRegex)) {
-    const tableBlock = match[1];
-    const matchStart = match.index! + (match[0].startsWith('\n') ? 1 : 0);
-
-    // Add preceding text as markdown
-    const before = text.slice(lastIndex, matchStart).trim();
-    if (before) {
-      elements.push({ tag: 'markdown', content: truncateContent(before) });
-    }
-
-    // Try to parse and convert the table
-    const parsed = parseMarkdownTable(tableBlock);
-    if (parsed && parsed.headers.length > 0 && parsed.rows.length > 0) {
-      elements.push(buildFeishuTableElement(parsed));
-    } else {
-      // Fallback: keep as markdown (code block)
-      elements.push({ tag: 'markdown', content: '```\n' + tableBlock.trim() + '\n```' });
-    }
-
-    lastIndex = matchStart + tableBlock.length;
-  }
-
-  // Add remaining text
-  const remaining = text.slice(lastIndex).trim();
-  if (remaining) {
-    elements.push({ tag: 'markdown', content: truncateContent(remaining) });
-  }
-
-  return elements;
-}
-
-function truncateContent(text: string, maxLen: number = MAX_CONTENT_LENGTH): string {
-  if (text.length <= maxLen) return text;
-  const half = Math.floor(maxLen / 2) - 50;
+function truncateContent(text: string): string {
+  if (text.length <= MAX_CONTENT_LENGTH) return text;
+  const half = Math.floor(MAX_CONTENT_LENGTH / 2) - 50;
   return (
     text.slice(0, half) +
     '\n\n... (content truncated) ...\n\n' +
@@ -146,151 +45,130 @@ function truncateContent(text: string, maxLen: number = MAX_CONTENT_LENGTH): str
   );
 }
 
-function formatElapsed(ms: number): string {
-  const totalSec = Math.floor(ms / 1000);
-  if (totalSec < 60) return `${totalSec}s`;
-  const min = Math.floor(totalSec / 60);
-  const sec = totalSec % 60;
-  return `${min}m${sec}s`;
-}
-
 export function buildCard(state: CardState): string {
   const config = STATUS_CONFIG[state.status];
   const elements: unknown[] = [];
 
-  // Calculate elapsed time for header
-  const elapsed = state.startTime ? formatElapsed(Date.now() - state.startTime) : undefined;
-
-  // Collect all detail elements into a separate array to wrap in one top-level collapsible panel
-  const detailLines: string[] = [];
-
-  // Tool calls section — listed as plain text lines inside the detail panel
-  if (state.toolCalls.length > 0) {
-    for (const t of state.toolCalls) {
-      const icon = t.status === 'running' ? '⏳' : '✅';
-      let line = `${icon} **${t.name}** ${t.detail}`;
-      if (t.status === 'done' && t.input) {
-        line += `\n> Input: \`${truncateContent(t.input, 300)}\``;
-      }
-      if (t.status === 'done' && t.output) {
-        line += `\n> Output: \`${truncateContent(t.output, 300)}\``;
-      }
-      detailLines.push(line);
-    }
-  }
-
-  // Subagent tasks section
-  if (state.subagentTasks && state.subagentTasks.length > 0) {
-    if (detailLines.length > 0) detailLines.push('---');
-    for (const task of state.subagentTasks) {
-      const icon = task.status === 'running' ? '⏳' : task.status === 'completed' ? '✅' : '❌';
-      let line = `${icon} **Agent:** ${truncateContent(task.description, 80)}`;
-      if (task.summary) line += `\n> ${task.summary}`;
-      if (task.usage) {
-        line += `\n> Tokens: ${task.usage.total_tokens} · Tools: ${task.usage.tool_uses} · ${(task.usage.duration_ms / 1000).toFixed(1)}s`;
-      }
-      if (task.toolCalls && task.toolCalls.length > 0) {
-        for (const t of task.toolCalls) {
-          const tIcon = t.status === 'running' ? '⏳' : '✅';
-          line += `\n> ${tIcon} ${t.name} ${t.detail}`;
-        }
-      }
-      if (task.thinkingText?.trim()) {
-        line += `\n> 💭 _${truncateContent(task.thinkingText.trim(), 200)}_`;
-      }
-      detailLines.push(line);
-    }
-  }
-
-  // Tool use summaries
-  if (state.toolSummaries && state.toolSummaries.length > 0) {
-    if (detailLines.length > 0) detailLines.push('---');
-    for (const summary of state.toolSummaries) {
-      detailLines.push(`📋 ${truncateContent(summary, 500)}`);
-    }
-  }
-
-  // Thinking content — only if non-empty
-  if (state.thinkingText?.trim()) {
-    if (detailLines.length > 0) detailLines.push('---');
-    detailLines.push(`💭 _${truncateContent(state.thinkingText.trim(), 1000)}_`);
-  }
-
-  // Wrap all detail content in a single top-level collapsible panel
-  if (detailLines.length > 0) {
-    // Build a summary label for the panel header showing tool names
-    const agentCount = state.subagentTasks?.length ?? 0;
-    const labelParts: string[] = [];
-    if (state.toolCalls.length > 0) {
-      const uniqueNames = [...new Set(state.toolCalls.map((t) => t.name))];
-      const nameStr =
-        uniqueNames.length <= 5
-          ? uniqueNames.join(' · ')
-          : uniqueNames.slice(0, 4).join(' · ') + ` +${uniqueNames.length - 4}`;
-      labelParts.push(nameStr);
-    }
-    if (agentCount > 0) labelParts.push(`${agentCount} agent${agentCount > 1 ? 's' : ''}`);
-    if (state.thinkingText?.trim() && labelParts.length === 0) labelParts.push('thinking');
-    const label = labelParts.length > 0 ? labelParts.join(' · ') : 'details';
-
+  // Goal badge — pinned at the top so users see at a glance that the
+  // session is in goal-driven mode (Claude /goal). Persists across turns
+  // until /goal clear or /reset.
+  if (state.goalCondition) {
     elements.push({
-      tag: 'collapsible_panel',
-      expanded: false,
-      header: {
-        title: {
-          tag: 'plain_text',
-          content: `🔧 ${label}`,
-        },
-      },
-      border: { color: 'grey' },
-      elements: [
-        {
-          tag: 'markdown',
-          content: detailLines.join('\n\n'),
-        },
-      ],
+      tag: 'markdown',
+      content: `🎯 **Goal:** ${truncate(state.goalCondition, 200)}`,
     });
+    elements.push({ tag: 'hr' });
   }
 
-  // Response content — convert Markdown tables to Feishu table components
+  // Agent Teams panel — teammates + shared task list. Driven by Claude
+  // Code's TaskCreated / TaskCompleted / TeammateIdle hooks; rendered here
+  // so the user sees the team state without having to switch panes.
+  if (state.teamState && (state.teamState.teammates.length > 0 || state.teamState.tasks.length > 0)) {
+    const ts = state.teamState;
+    const lines: string[] = [];
+    const header = ts.name ? `🧑‍🤝‍🧑 **Team:** \`${ts.name}\`` : '🧑‍🤝‍🧑 **Team**';
+    lines.push(header);
+    if (ts.teammates.length > 0) {
+      lines.push('');
+      lines.push('**Teammates:**');
+      for (const m of ts.teammates) {
+        const icon = m.status === 'working' ? '⏳' : '💤';
+        const subj = m.lastSubject ? ` — _${truncate(m.lastSubject, 60)}_` : '';
+        lines.push(`${icon} \`${m.name}\` (${m.status})${subj}`);
+      }
+    }
+    if (ts.tasks.length > 0) {
+      // Show in-progress first, then most recent completions
+      const inProgress = ts.tasks.filter(t => t.status === 'in_progress');
+      const completed = ts.tasks.filter(t => t.status === 'completed').slice(-5);
+      lines.push('');
+      lines.push(`**Tasks:** ${inProgress.length} in progress · ${ts.tasks.filter(t => t.status === 'completed').length} done`);
+      for (const t of inProgress) {
+        const owner = t.teammate ? ` → \`${t.teammate}\`` : '';
+        lines.push(`⏳ ${truncate(t.subject, 80)}${owner}`);
+      }
+      for (const t of completed) {
+        const owner = t.teammate ? ` (\`${t.teammate}\`)` : '';
+        lines.push(`✅ ${truncate(t.subject, 80)}${owner}`);
+      }
+    }
+    elements.push({ tag: 'markdown', content: lines.join('\n') });
+    elements.push({ tag: 'hr' });
+  }
+
+  // Tool calls indicator — single line, no per-tool list. See the v2 builder
+  // for the rationale (users only care about the final answer; the running
+  // tool list was noise). One line while in flight so a hung run is visibly
+  // hung; section disappears entirely on complete/error.
+  if (
+    state.toolCalls.length > 0 &&
+    state.status !== 'complete' &&
+    state.status !== 'error'
+  ) {
+    const last  = state.toolCalls[state.toolCalls.length - 1];
+    const icon  = last.status === 'running' ? '⏳' : '✅';
+    const total = state.toolCalls.length;
+    elements.push({
+      tag: 'markdown',
+      content: `${icon} **${last.name}** · ${total} tool${total > 1 ? 's' : ''}`,
+    });
+    elements.push({ tag: 'hr' });
+  }
+
+  // Background tasks (Monitor, etc.) — show live stdout events / final status
+  if (state.backgroundEvents && state.backgroundEvents.length > 0) {
+    const lines = state.backgroundEvents.map((ev) => {
+      const icon = BG_ICON[ev.status];
+      const shortId = ev.taskId.slice(0, 6);
+      const desc = truncate(ev.description, 60);
+      const last = ev.lastEvent ? ` — _${truncate(ev.lastEvent, 140)}_` : '';
+      return `${icon} **${desc}** \`${shortId}\`${last}`;
+    });
+    elements.push({
+      tag: 'markdown',
+      content: '📡 **Background**\n' + lines.join('\n'),
+    });
+    elements.push({ tag: 'hr' });
+  }
+
+  // Response content
   if (state.responseText) {
-    elements.push(...splitMarkdownWithTables(state.responseText));
+    elements.push({
+      tag: 'markdown',
+      content: truncateContent(state.responseText),
+    });
   } else if (state.status === 'thinking') {
     elements.push({
       tag: 'markdown',
-      content: elapsed ? `_Claude is thinking... (${elapsed})_` : '_Claude is thinking..._',
+      content: '_Thinking..._',
     });
   }
 
-  // Pending question section
+  // Pending question section — text-only: numbered options + prominent
+  // "type the number" instruction. Buttons used to live here, but:
+  //   - Card Schema 2.0 mobile silently drops `tag: action` button blocks
+  //     (bug-feishu-v2-mobile-action-buttons), so buttons go invisible.
+  //   - Card Schema 1.0 buttons DO render on mobile, but clicks return
+  //     Feishu code 200340 (the click event never reaches us, suspected
+  //     v1 callbacks no longer route through `WSClient` persistent
+  //     connection in the v2 era — would require setting up an HTTP
+  //     webhook URL in the Feishu Open Platform app config).
+  // Decision: drop buttons entirely, default to typed answers. The text
+  // path is reliable on every Feishu surface (desktop / mobile / web).
   if (state.pendingQuestion) {
     elements.push({ tag: 'hr' });
-    // Only display the first question — the bridge only collects one answer
-    // at a time. If Claude batches multiple questions, they will be asked
-    // sequentially as Claude re-asks unanswered ones.
-    const questionLines: string[] = [];
-    const q = state.pendingQuestion.questions[0];
-    if (q) {
-      questionLines.push(`**[${q.header}] ${q.question}**`);
-      questionLines.push('');
-      q.options.forEach((opt, i) => {
-        questionLines.push(`**${i + 1}.** ${opt.label} — _${opt.description}_`);
+    state.pendingQuestion.questions.forEach((q) => {
+      const descLines = q.options.map(
+        (opt, i) => `**${i + 1}.** ${opt.label} — _${opt.description}_`,
+      );
+      elements.push({
+        tag: 'markdown',
+        content: [`**[${q.header}] ${q.question}**`, '', ...descLines].join('\n'),
       });
-      questionLines.push(`**${q.options.length + 1}.** Other（输入自定义回答）`);
-      questionLines.push('');
-    }
-    questionLines.push('_回复数字选择，或直接输入自定义答案_');
-    elements.push({
-      tag: 'markdown',
-      content: questionLines.join('\n'),
     });
-  }
-
-  // Retry info (shown during 403 auto-retry)
-  if (state.retryInfo) {
     elements.push({
       tag: 'markdown',
-      content: `⏳ ${state.retryInfo}`,
+      content: '**👇 请回复数字（1/2/…）或直接输入文字答案**',
     });
   }
 
@@ -305,15 +183,6 @@ export function buildCard(state: CardState): string {
   // Stats note — show context usage during all states, full stats on complete/error
   {
     const parts: string[] = [];
-    if (state.thinking) {
-      parts.push(`thinking:${state.thinking}`);
-    }
-    if (state.effort) {
-      parts.push(`effort:${state.effort}`);
-    }
-    if (state.numTurns !== undefined) {
-      parts.push(`${state.numTurns} turns`);
-    }
     if (state.totalTokens && state.contextWindow) {
       const pct = Math.round((state.totalTokens / state.contextWindow) * 100);
       const tokensK = state.totalTokens >= 1000
@@ -323,24 +192,17 @@ export function buildCard(state: CardState): string {
       parts.push(`ctx: ${tokensK}/${ctxK} (${pct}%)`);
     }
     if (state.status === 'complete' || state.status === 'error') {
-      const cost = state.sessionCostUsd ?? state.costUsd;
-      if (cost != null) {
-        parts.push(`$${cost.toFixed(2)}`);
+      if (state.sessionCostUsd != null) {
+        parts.push(`$${state.sessionCostUsd.toFixed(2)}`);
       }
       if (state.model) {
+        // Strip the claude- prefix (claude-opus-4-7 → opus-4-7) but keep the
+        // full Kimi model name since e.g. `for-coding` loses too much context.
         parts.push(state.model.replace(/^claude-/, ''));
       }
       if (state.durationMs !== undefined) {
         parts.push(`${(state.durationMs / 1000).toFixed(1)}s`);
       }
-    }
-    if (state.workingDirectory) {
-      const dir = state.workingDirectory;
-      const short = dir.length > 40 ? '.../' + dir.split('/').slice(-2).join('/') : dir;
-      parts.push(`📁 ${short}`);
-    }
-    if (state.sessionId) {
-      parts.push(`🔑 ${state.sessionId.slice(0, 8)}`);
     }
     if (parts.length > 0) {
       elements.push({
@@ -348,7 +210,7 @@ export function buildCard(state: CardState): string {
         elements: [
           {
             tag: 'plain_text',
-            content: parts.join('  ·  '),
+            content: parts.join(' | '),
           },
         ],
       });
@@ -356,13 +218,13 @@ export function buildCard(state: CardState): string {
   }
 
   const card = {
-    config: { wide_screen_mode: true },
+    // update_multi lets us re-render the same card after an action click
+    // without hitting Feishu error 108002 ("card has already been updated").
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
       template: config.color,
       title: {
-        content: elapsed && (state.status === 'thinking' || state.status === 'running')
-          ? `${config.icon} ${config.title} (${elapsed})`
-          : `${config.icon} ${config.title}`,
+        content: `${config.icon} ${config.title}`,
         tag: 'plain_text',
       },
     },

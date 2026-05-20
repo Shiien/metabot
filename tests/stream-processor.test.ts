@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { StreamProcessor, extractImagePaths } from '../src/claude/stream-processor.js';
-import type { SDKMessage } from '../src/claude/executor.js';
+import { StreamProcessor, extractImagePaths } from '../src/engines/claude/stream-processor.js';
+import type { SDKMessage } from '../src/engines/claude/executor.js';
 
 function msg(overrides: Partial<SDKMessage>): SDKMessage {
   return { type: 'system', session_id: 'sess-1', ...overrides } as SDKMessage;
@@ -74,29 +74,6 @@ describe('StreamProcessor', () => {
     expect(state.responseText).toBe('Done!');
     expect(state.costUsd).toBe(0.05);
     expect(state.durationMs).toBe(1200);
-  });
-
-  it('captures num_turns from result message', () => {
-    const p = new StreamProcessor('hi');
-    const state = p.processMessage(msg({
-      type: 'result',
-      subtype: 'success',
-      result: 'Done!',
-      num_turns: 7,
-    }));
-    expect(state.numTurns).toBe(7);
-  });
-
-  it('populates workingDirectory from constructor arg', () => {
-    const p = new StreamProcessor('hi', undefined, '/home/user/project');
-    const state = p.processMessage(msg({ type: 'system', session_id: 'sess-1' }));
-    expect(state.workingDirectory).toBe('/home/user/project');
-  });
-
-  it('includes sessionId in CardState after receiving it', () => {
-    const p = new StreamProcessor('hi');
-    const state = p.processMessage(msg({ type: 'system', session_id: 'abc-123' }));
-    expect(state.sessionId).toBe('abc-123');
   });
 
   it('processes error result message', () => {
@@ -175,7 +152,7 @@ describe('StreamProcessor', () => {
     expect(p.getImagePaths()).toEqual([]);
   });
 
-  it('does not auto-respond to ExitPlanMode (SDK handles it in bypassPermissions mode)', () => {
+  it('detects ExitPlanMode as SDK-handled tool', () => {
     const p = new StreamProcessor('hi');
     p.processMessage(msg({
       type: 'assistant',
@@ -189,8 +166,12 @@ describe('StreamProcessor', () => {
         }],
       },
     }));
-    const tools = p.drainAutoRespondTools();
-    expect(tools).toHaveLength(0);
+    const tools = p.drainSdkHandledTools();
+    expect(tools).toHaveLength(1);
+    expect(tools[0].toolUseId).toBe('tool-plan1');
+    expect(tools[0].name).toBe('ExitPlanMode');
+    // Second drain should be empty
+    expect(p.drainSdkHandledTools()).toHaveLength(0);
   });
 
   it('does not detect ExitPlanMode from subagent', () => {
@@ -207,7 +188,7 @@ describe('StreamProcessor', () => {
         }],
       },
     }));
-    expect(p.drainAutoRespondTools()).toHaveLength(0);
+    expect(p.drainSdkHandledTools()).toHaveLength(0);
   });
 
   it('marks all tools as done on result', () => {
@@ -223,6 +204,116 @@ describe('StreamProcessor', () => {
       result: 'ok',
     }));
     expect(state.toolCalls.every(t => t.status === 'done')).toBe(true);
+  });
+});
+
+describe('StreamProcessor background task events', () => {
+  it('surfaces task_started as a running background event', () => {
+    const p = new StreamProcessor('hi');
+    const state = p.processMessage(msg({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 't-1',
+      description: 'Watching CI for PR #215',
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents).toEqual([
+      { taskId: 't-1', description: 'Watching CI for PR #215', status: 'running', lastEvent: undefined },
+    ]);
+  });
+
+  it('updates description + lastEvent on task_progress', () => {
+    const p = new StreamProcessor('hi');
+    p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 't-1', description: 'Watching CI',
+    } as unknown as SDKMessage));
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_progress', task_id: 't-1',
+      description: 'Watching CI', summary: 'check (20) running',
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents?.[0]).toEqual({
+      taskId: 't-1', description: 'Watching CI', status: 'running', lastEvent: 'check (20) running',
+    });
+  });
+
+  it('marks a task completed with its final summary on task_notification', () => {
+    const p = new StreamProcessor('hi');
+    p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 't-1', description: 'Watch build',
+    } as unknown as SDKMessage));
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_notification', task_id: 't-1',
+      status: 'completed', summary: 'CI done: success',
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents?.[0]).toMatchObject({
+      taskId: 't-1', status: 'completed', lastEvent: 'CI done: success',
+    });
+  });
+
+  it('picks up failed / stopped statuses from task_notification', () => {
+    const p = new StreamProcessor('hi');
+    const failed = p.processMessage(msg({
+      type: 'system', subtype: 'task_notification', task_id: 't-fail',
+      status: 'failed', summary: 'crashed',
+    } as unknown as SDKMessage));
+    expect(failed.backgroundEvents?.[0].status).toBe('failed');
+
+    const stopped = p.processMessage(msg({
+      type: 'system', subtype: 'task_notification', task_id: 't-stop',
+      status: 'stopped',
+    } as unknown as SDKMessage));
+    expect(stopped.backgroundEvents?.find(e => e.taskId === 't-stop')?.status).toBe('stopped');
+  });
+
+  it('applies status patches from task_updated', () => {
+    const p = new StreamProcessor('hi');
+    p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 't-1', description: 'Watch build',
+    } as unknown as SDKMessage));
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_updated', task_id: 't-1',
+      patch: { status: 'killed' },
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents?.[0].status).toBe('failed');
+  });
+
+  it('hides ambient / skip_transcript tasks from the card', () => {
+    const p = new StreamProcessor('hi');
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 'housekeeping',
+      description: 'Ambient thing', skip_transcript: true,
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents).toBeUndefined();
+  });
+
+  it('ignores task events without a task_id', () => {
+    const p = new StreamProcessor('hi');
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_started', description: 'no id',
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents).toBeUndefined();
+  });
+
+  it('renders Codex translator task_notification events too', () => {
+    const p = new StreamProcessor('hi');
+    const state = p.processMessage(msg({
+      type: 'task_notification', session_id: 'codex-sess', result: 'rate limited',
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents?.[0]).toMatchObject({
+      taskId: 'codex-sess', lastEvent: 'rate limited',
+    });
+  });
+
+  it('propagates backgroundEvents through the result message', () => {
+    const p = new StreamProcessor('hi');
+    p.processMessage(msg({
+      type: 'system', subtype: 'task_notification', task_id: 't-1',
+      status: 'completed', summary: 'done',
+    } as unknown as SDKMessage));
+    const result = p.processMessage(msg({
+      type: 'result', subtype: 'success', result: 'all set', total_cost_usd: 0, duration_ms: 10,
+    }));
+    expect(result.status).toBe('complete');
+    expect(result.backgroundEvents?.[0]).toMatchObject({ taskId: 't-1', status: 'completed' });
   });
 });
 

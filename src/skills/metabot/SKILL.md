@@ -1,39 +1,50 @@
 ---
 name: metabot
-description: "MetaBot HTTP API for agent collaboration: talk to other bots, schedule tasks, manage bots and peers. Use when the user wants to delegate work to another bot, schedule tasks, create/remove bots, or check peer status."
+description: "Talk to other MetaBot bots (`mb talk` — send a message to another bot, including cross-instance peers). Use when you want to delegate to or message another bot, e.g. 'talk to bot X', '跟其他 bot 说话', 'send message to peer bot', 'ask the deploy-bot', 'delegate to bot'. Also covers bot/peer management, skill hub, voice calls."
 ---
 
-## MetaBot API
+## Quickstart — Talk to another bot
 
-MetaBot exposes an HTTP API for agent-to-agent collaboration, task scheduling, and bot management.
+Use this skill whenever you want to send a message to another MetaBot bot. The `mb` CLI is pre-installed and handles auth automatically.
 
-Your bot name and chat ID are provided in the system prompt (look for "You are running as bot ... in chat ..."). Use those values for `botName` and `chatId` in the commands below.
+```bash
+# Talk to a local bot
+mb talk <botName> <chatId> "<message>"
 
-### Quick Commands (mb shortcut)
+# Talk to a bot on a federated peer instance
+mb talk <peerName>/<botName> <chatId> "<message>"
+```
 
-The `mb` shell function is pre-installed and handles auth automatically. **Prefer `mb` over raw curl:**
+**Semantics:**
+- **Asynchronous.** The target bot receives the message in its own chat/session and processes the turn there. Its reply lands in the target bot's chat (not as the return value of this command).
+- **Cross-instance auto-routing.** If `<botName>` isn't on this instance, MetaBot transparently forwards to the peer that hosts it. Use `<peerName>/<botName>` to target a specific peer directly.
+- **Discovery.** Run `mb bots` to list all reachable bots (local + peer). Use `mb peers` to see federated instances.
+
+**Not the same as Agent Teams `SendMessage`:** `SendMessage` addresses teammates inside your current Agent Team session. `mb talk` addresses other bots — separate sessions, separate chats, separate users on the other side.
+
+Your own bot name and chat ID are in the system prompt ("You are running as bot ... in chat ...") — pass those as needed.
+
+### Examples
+
+```bash
+# Ask backend-bot to deploy something
+mb talk backend-bot chat_AAA "Please deploy the latest dev branch and report when green."
+
+# Ask a peer's research-bot to look something up
+mb talk alice/research-bot chat_BBB "What does our retention dashboard say for last week?"
+```
+
+## Other `mb` Commands
+
+The `mb` shell function wraps the MetaBot HTTP API. Talk is the headline; the rest below covers management, peers, and observability.
 
 ```bash
 # Bots
 mb bots                                    # List all bots (local + peer)
 mb bot <name>                              # Get bot details
 
-# Agent Talk (cross-instance auto-routing)
-mb talk <botName> <chatId> <prompt>        # Talk to a bot
-mb talk alice/backend-bot <chatId> <prompt> # Talk to a specific peer's bot
-
 # Peers
 mb peers                                   # List peers and their status
-
-# Scheduling (one-time)
-mb schedule list                           # List all scheduled tasks
-mb schedule add <bot> <chatId> <sec> <prompt>  # Schedule a one-time future task
-mb schedule cancel <id>                    # Cancel a scheduled task
-
-# Scheduling (recurring / cron)
-mb schedule cron <bot> <chatId> '<cronExpr>' <prompt>  # Create recurring task
-mb schedule pause <id>                     # Pause a recurring task
-mb schedule resume <id>                    # Resume a paused recurring task
 
 # Voice Call (RTC — real-time Doubao AI)
 mb voice call <bot> <chatId> [prompt]      # Start voice call, wait for transcript
@@ -57,17 +68,20 @@ mb metrics                                 # Prometheus metrics
 mb health                                  # Health check
 ```
 
-### Cross-Instance Agent Talk
+### Scheduling (use Claude Code native tools first)
 
-When you talk to a bot that isn't on the local instance, MetaBot automatically routes the request to the peer instance that hosts that bot. No special syntax is needed — just use `mb talk <botName> <chatId> <prompt>` as usual.
+For ad-hoc scheduling within this session, prefer Claude Code's native scheduling tools instead of MetaBot's HTTP scheduler:
 
-Use qualified names to target a specific peer: `mb talk <peerName>/<botName> <chatId> <prompt>`.
+- **`CronCreate`** — fire a prompt at a cron-matched time (recurring or one-shot). Sessions-only by default; pass `durable: true` to persist across restarts. Ideal for "remind me in 10 minutes" and "every weekday at 9 am" inside one conversation.
+- **`/loop [interval] <prompt>`** — turn a task into a self-paced loop with fixed or dynamic intervals (e.g. `/loop 5m check the deploy`). Best for "poll until done" workflows.
 
-Use `mb bots` to see all available bots including those on peer instances (they will have `peerName` and `peerUrl` fields indicating which instance hosts them).
+These run inside the current Claude session, with no MetaBot server involvement, and stop when the session ends.
+
+If you need **persistent server-side scheduling** that survives Claude restarts and lives in MetaBot's scheduler (so other bots / your future self can list and cancel them via `mb`), invoke the optional `/metaschedule` skill — it documents the `mb schedule` / `/api/schedule` surface. The skill ships with the MetaBot source tree but is **not installed by default**; copy `src/skills/metaschedule/` into `~/.claude/skills/` (or the bot's `.claude/skills/`) to enable it.
 
 ### API Reference (for complex operations)
 
-For operations not covered by `mb` (creating bots, updating tasks, sendCards option), use the API directly.
+For operations not covered by `mb` (creating bots, sendCards option), use the API directly.
 Auth header: `-H "Authorization: Bearer $METABOT_API_SECRET"`
 Base URL: !`echo http://localhost:${METABOT_API_PORT:-9100}`
 
@@ -100,39 +114,6 @@ curl -s -X POST http://localhost:${METABOT_API_PORT:-9100}/api/bots \
 ```bash
 curl -s -X DELETE http://localhost:${METABOT_API_PORT:-9100}/api/bots/<name> \
   -H "Authorization: Bearer $METABOT_API_SECRET"
-```
-
-**Update scheduled task:**
-```bash
-curl -s -X PATCH http://localhost:${METABOT_API_PORT:-9100}/api/schedule/<id> \
-  -H "Authorization: Bearer $METABOT_API_SECRET" \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"updated prompt","delaySeconds":7200}'
-```
-
-**Create recurring scheduled task (cron):**
-```bash
-curl -s -X POST http://localhost:${METABOT_API_PORT:-9100}/api/schedule \
-  -H "Authorization: Bearer $METABOT_API_SECRET" \
-  -H "Content-Type: application/json" \
-  -d '{"botName":"<bot>","chatId":"<chatId>","prompt":"<task>","cronExpr":"0 8 * * 1-5","timezone":"Asia/Shanghai","label":"Daily report"}'
-```
-Cron format: `minute hour day month weekday` (5 fields). Examples: `0 8 * * *` = daily 8am, `0 8 * * 1-5` = weekdays 8am, `*/30 * * * *` = every 30 min. Default timezone: Asia/Shanghai.
-
-**Pause/resume recurring task:**
-```bash
-curl -s -X POST http://localhost:${METABOT_API_PORT:-9100}/api/schedule/<id>/pause \
-  -H "Authorization: Bearer $METABOT_API_SECRET"
-curl -s -X POST http://localhost:${METABOT_API_PORT:-9100}/api/schedule/<id>/resume \
-  -H "Authorization: Bearer $METABOT_API_SECRET"
-```
-
-**Update recurring task:**
-```bash
-curl -s -X PATCH http://localhost:${METABOT_API_PORT:-9100}/api/schedule/<id> \
-  -H "Authorization: Bearer $METABOT_API_SECRET" \
-  -H "Content-Type: application/json" \
-  -d '{"cronExpr":"0 9 * * *","prompt":"Updated prompt","timezone":"Asia/Shanghai"}'
 ```
 
 **List peers:**

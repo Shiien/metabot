@@ -68,12 +68,24 @@ async function startFeishuBot(botConfig: BotConfig, logger: Logger, memoryServer
   const handle: Partial<FeishuBotHandle> = { lastWsActivity: Date.now() };
 
   // Create event dispatcher wired to the bridge
-  const dispatcher = createEventDispatcher(botConfig, botLogger, (msg) => {
-    handle.lastWsActivity = Date.now();
-    bridge.handleMessage(msg).catch((err) => {
-      botLogger.error({ err, msg }, 'Unhandled error in message bridge');
-    });
-  }, botOpenId, rawSender);
+  const dispatcher = createEventDispatcher(
+    botConfig,
+    botLogger,
+    (msg) => {
+      handle.lastWsActivity = Date.now();
+      bridge.handleMessage(msg).catch((err) => {
+        botLogger.error({ err, msg }, 'Unhandled error in message bridge');
+      });
+    },
+    botOpenId,
+    rawSender,
+    (event) => {
+      handle.lastWsActivity = Date.now();
+      bridge.handleCardAction(event).catch((err) => {
+        botLogger.error({ err, event }, 'Unhandled error in card action handler');
+      });
+    },
+  );
 
   // Create WebSocket client
   const wsClient = new lark.WSClient({
@@ -348,22 +360,19 @@ async function main() {
       memoryServer.server.close();
       memoryServer.storage.close();
     }
-    const destroyPromises: Promise<void>[] = [];
     for (const handle of feishuHandles) {
-      destroyPromises.push(handle.bridge.destroy());
+      handle.bridge.destroy();
     }
     for (const handle of telegramHandles) {
-      destroyPromises.push(handle.bridge.destroy());
+      handle.bridge.destroy();
       handle.bot.stop();
     }
     for (const handle of wechatHandles) {
-      destroyPromises.push(handle.bridge.destroy());
+      handle.bridge.destroy();
       handle.stop();
     }
-    await Promise.race([
-      Promise.all(destroyPromises),
-      new Promise<void>((r) => setTimeout(r, 5000)),
-    ]);
+    // Give in-flight requests a brief moment to settle before exit.
+    await new Promise<void>((r) => setTimeout(r, 200));
     process.exit(0);
   };
 

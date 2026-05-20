@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # MetaBot Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/Shiien/metabot/main/install.sh | bash
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/Shiien/metabot/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Shiien/metabot/main/install.sh | bash -s -- --dir /opt/metabot
+#   METABOT_HOME=/opt/metabot bash install.sh
 set -euo pipefail
 
 # ============================================================================
@@ -14,9 +17,58 @@ else
 fi
 
 # ============================================================================
+# Parse CLI arguments
+# ============================================================================
+INSTALL_DIR_ARG=""
+print_usage() {
+  cat <<'USAGE'
+MetaBot Installer
+
+Usage:
+  bash install.sh [OPTIONS]
+  curl -fsSL <url> | bash -s -- [OPTIONS]
+
+Options:
+  -d, --dir <path>     Install MetaBot to <path>.
+                       Priority: --dir > METABOT_HOME env var > interactive prompt.
+                       Default: $HOME/metabot
+  -h, --help           Show this help and exit.
+
+Examples:
+  bash install.sh
+  bash install.sh --dir /opt/metabot
+  bash install.sh -d ~/projects/metabot
+  METABOT_HOME=/opt/metabot bash install.sh
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--dir)
+      [[ $# -ge 2 ]] || { echo "Error: $1 requires a path argument" >&2; exit 1; }
+      INSTALL_DIR_ARG="$2"
+      shift 2
+      ;;
+    --dir=*)
+      INSTALL_DIR_ARG="${1#--dir=}"
+      shift
+      ;;
+    -h|--help)
+      print_usage
+      exit 0
+      ;;
+    *)
+      echo "Warning: unknown argument '$1'" >&2
+      shift
+      ;;
+  esac
+done
+
+# ============================================================================
 # Configuration defaults
 # ============================================================================
-METABOT_HOME="${METABOT_HOME:-$HOME/metabot}"
+# METABOT_HOME is resolved later (Phase 0.5) — priority: --dir > env var > prompt > default.
+DEFAULT_METABOT_HOME="$HOME/metabot"
 METABOT_REPO="${METABOT_REPO:-https://github.com/Shiien/metabot.git}"
 
 # ============================================================================
@@ -132,6 +184,43 @@ sed_i() {
 }
 
 # ============================================================================
+# Phase 0.5: Resolve install directory
+# Priority: --dir CLI arg > METABOT_HOME env var > interactive prompt > default.
+# ============================================================================
+step "Phase 0.5: Choose install directory"
+
+if [[ -n "$INSTALL_DIR_ARG" ]]; then
+  METABOT_HOME="$INSTALL_DIR_ARG"
+  info "Using install directory from --dir: $METABOT_HOME"
+elif [[ -n "${METABOT_HOME:-}" ]]; then
+  info "Using install directory from METABOT_HOME env: $METABOT_HOME"
+else
+  echo ""
+  echo -e "${BOLD}Where should MetaBot be installed?${NC}"
+  echo "  (You can override later with the METABOT_HOME env var or --dir flag.)"
+  prompt_input METABOT_HOME "Install directory" "$DEFAULT_METABOT_HOME"
+fi
+
+# Expand a leading ~ to $HOME (avoids eval; safe with spaces).
+METABOT_HOME="${METABOT_HOME/#\~/$HOME}"
+
+# Require an absolute path so all later $METABOT_HOME references are unambiguous.
+if [[ "$METABOT_HOME" != /* ]]; then
+  error "Install path must be absolute, got: $METABOT_HOME"
+  exit 1
+fi
+
+# Refuse a few obviously-bad targets that would clobber the user's home or root.
+case "$METABOT_HOME" in
+  /|/root|/home|/Users|"$HOME")
+    error "Refusing to install directly into $METABOT_HOME — pick a dedicated subdirectory."
+    exit 1
+    ;;
+esac
+
+success "Install directory: $METABOT_HOME"
+
+# ============================================================================
 # Phase 1: Check prerequisites
 # ============================================================================
 step "Phase 1: Checking prerequisites"
@@ -240,7 +329,18 @@ if [[ -d "$METABOT_HOME/.git" ]]; then
   info "Existing installation found, pulling latest..."
   cd "$METABOT_HOME"
   OLD_HEAD="$(git rev-parse HEAD)"
-  git pull --ff-only || warn "git pull failed, continuing with existing code"
+  if ! git pull --ff-only; then
+    error "git pull --ff-only failed at $METABOT_HOME."
+    error "Your checkout has diverged from origin or has uncommitted changes."
+    error "Continuing with stale code would silently break later phases (e.g. Phase 6 'skill not found')."
+    error ""
+    error "Fix one of these and re-run install.sh:"
+    error "  - Inspect:        cd $METABOT_HOME && git status && git log --oneline -5"
+    error "  - Stash & retry:  cd $METABOT_HOME && git stash && git pull --ff-only"
+    error "  - Reset to origin (DESTROYS local commits/edits):"
+    error "      cd $METABOT_HOME && git fetch origin && git reset --hard origin/main"
+    exit 1
+  fi
   NEW_HEAD="$(git rev-parse HEAD)"
   # Re-exec with the updated install.sh if it changed (avoids running stale code from memory)
   if [[ "$OLD_HEAD" != "$NEW_HEAD" && -z "${METABOT_REEXEC:-}" ]]; then
@@ -278,6 +378,9 @@ else
   success "PM2 already installed"
 fi
 
+# Claude and Kimi CLI installs are driven by the engine choice in Phase 4.
+# We still ensure the Claude CLI is present as a default convenience, since
+# most users start with Claude and may mix engines later.
 if command -v claude &>/dev/null; then
   success "Claude CLI found: $(command -v claude)"
 else
@@ -289,6 +392,36 @@ else
     warn "Claude CLI install failed. Install manually: sudo npm install -g @anthropic-ai/claude-code"
   fi
 fi
+
+# Install uv + kimi-cli helper. Used by the Kimi engine path below.
+install_kimi_cli() {
+  if command -v kimi &>/dev/null; then
+    success "Kimi CLI found: $(command -v kimi)"
+    return 0
+  fi
+  # Need uv first (kimi-cli is a Python tool distributed via uv)
+  if ! command -v uv &>/dev/null; then
+    info "Installing uv (required by kimi-cli)..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 || true
+    # uv installs to ~/.local/bin — make sure it's on PATH for this script
+    export PATH="$HOME/.local/bin:$PATH"
+    if ! command -v uv &>/dev/null; then
+      warn "uv install failed. Install manually from https://astral.sh/uv and re-run."
+      return 1
+    fi
+    success "uv installed: $(uv --version)"
+  fi
+  info "Installing kimi-cli via uv..."
+  if uv tool install kimi-cli 2>&1 | tail -3; then
+    export PATH="$HOME/.local/bin:$PATH"
+    if command -v kimi &>/dev/null; then
+      success "Kimi CLI installed: $(command -v kimi)"
+      return 0
+    fi
+  fi
+  warn "Kimi CLI install failed. Install manually: uv tool install kimi-cli"
+  return 1
+}
 
 # ============================================================================
 # Phase 4: Interactive configuration
@@ -312,18 +445,61 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
   mkdir -p "$WORK_DIR"
   success "Working directory: ${WORK_DIR}"
 
-  # ------ 4b: Claude AI authentication ------
+  # ------ 4b: Engine selection ------
   echo ""
-  echo -e "${BOLD}Claude AI Authentication:${NC}"
-  echo "  1) Claude Code Subscription (OAuth — run 'claude login' after install)"
-  echo "  2) Anthropic API Key (sk-ant-...)"
-  echo "  3) Third-party provider (Kimi/Moonshot, DeepSeek, GLM, etc.)"
-  prompt_choice AUTH_CHOICE "1"
+  echo -e "${BOLD}Agent Engine:${NC}"
+  echo "  1) Claude Code (Anthropic)"
+  echo "  2) Kimi (Moonshot AI — requires kimi-cli login, uses your subscription)"
+  echo "  3) Codex CLI (OpenAI — requires codex login, uses your ChatGPT subscription)"
+  prompt_choice ENGINE_CHOICE "1"
 
+  BOT_ENGINE="claude"
   CLAUDE_AUTH_ENV_LINES=""
   CLAUDE_AUTH_METHOD="subscription"
 
+  if [[ "$ENGINE_CHOICE" == "2" ]]; then
+    BOT_ENGINE="kimi"
+    CLAUDE_AUTH_METHOD="kimi"
+    echo ""
+    info "Installing kimi-cli..."
+    install_kimi_cli || warn "Continuing despite kimi-cli install failure — you can install it later."
+    info "After install, run 'kimi login' in a separate terminal to authenticate."
+    # Skip the Claude provider prompt entirely for Kimi — it has its own auth.
+    AUTH_CHOICE="kimi"
+  elif [[ "$ENGINE_CHOICE" == "3" ]]; then
+    BOT_ENGINE="codex"
+    CLAUDE_AUTH_METHOD="codex"
+    echo ""
+    if command -v codex &>/dev/null; then
+      success "Codex CLI found: $(command -v codex)"
+    else
+      info "Installing Codex CLI..."
+      npm_install_global @openai/codex
+      if command -v codex &>/dev/null; then
+        success "Codex CLI installed: $(command -v codex)"
+      else
+        warn "Codex CLI install failed. Install manually: sudo npm install -g @openai/codex"
+        warn "MetaBot will still be configured — install Codex + run 'codex login' before starting."
+      fi
+    fi
+    info "After install, run 'codex login' in a separate terminal to authenticate (or set OPENAI_API_KEY / configure a profile in ~/.codex/config.toml)."
+    info "Note: Codex runs with approvalPolicy='never' and sandbox='workspace-write' by default — interactive tool approvals are not surfaced to IM."
+    # Skip the Claude provider prompt entirely for Codex — it has its own auth.
+    AUTH_CHOICE="codex"
+  else
+    # ------ 4b-claude: Claude AI authentication ------
+    echo ""
+    echo -e "${BOLD}Claude AI Authentication:${NC}"
+    echo "  1) Claude Code Subscription (OAuth — run 'claude login' after install)"
+    echo "  2) Anthropic API Key (sk-ant-...)"
+    echo "  3) Third-party provider (Kimi/Moonshot, DeepSeek, GLM, etc.)"
+    prompt_choice AUTH_CHOICE "1"
+  fi
+
   case "$AUTH_CHOICE" in
+    kimi|codex)
+      : # handled above
+      ;;
     1)
       CLAUDE_AUTH_METHOD="subscription"
       info "Using Claude Code Subscription. Run 'claude login' after install."
@@ -470,9 +646,16 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     echo "API_PORT=${API_PORT}"
     echo "API_SECRET=${API_SECRET}"
     echo ""
-    echo "# Claude AI Authentication"
+    echo "# Agent Engine Authentication"
     if [[ "$CLAUDE_AUTH_METHOD" == "subscription" ]]; then
       echo "# Using Claude Code Subscription (OAuth). Run 'claude login' to authenticate."
+    elif [[ "$CLAUDE_AUTH_METHOD" == "kimi" ]]; then
+      echo "# Using Kimi CLI. Run 'kimi login' to authenticate."
+    elif [[ "$CLAUDE_AUTH_METHOD" == "codex" ]]; then
+      echo "# Using Codex CLI. Run 'codex login' to authenticate (or set OPENAI_API_KEY / configure ~/.codex/config.toml)."
+      echo "# CODEX_EXECUTABLE_PATH="
+      echo "# CODEX_APPROVAL_POLICY=never"
+      echo "# CODEX_SANDBOX=workspace-write"
     elif [[ -n "${CLAUDE_AUTH_ENV_LINES:-}" ]]; then
       echo "$CLAUDE_AUTH_ENV_LINES"
     fi
@@ -500,25 +683,33 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
 
   if [[ "$SETUP_FEISHU" == "true" ]]; then
     FEISHU_BOTS_JSON=$(node -e "
-      console.log(JSON.stringify([{
+      const engine = process.argv[5];
+      const bot = {
         name: process.argv[1],
         feishuAppId: process.argv[2],
         feishuAppSecret: process.argv[3],
-        defaultWorkingDirectory: process.argv[4]
-      }], null, 2))
-    " "$BOT_NAME" "$FEISHU_APP_ID" "$FEISHU_APP_SECRET" "$WORK_DIR")
+        defaultWorkingDirectory: process.argv[4],
+      };
+      if (engine === 'kimi') { bot.engine = 'kimi'; bot.kimi = { thinking: true }; }
+      if (engine === 'codex') { bot.engine = 'codex'; bot.codex = { approvalPolicy: 'never', sandbox: 'workspace-write' }; }
+      console.log(JSON.stringify([bot], null, 2))
+    " "$BOT_NAME" "$FEISHU_APP_ID" "$FEISHU_APP_SECRET" "$WORK_DIR" "${BOT_ENGINE:-claude}")
   fi
 
   if [[ "$SETUP_TELEGRAM" == "true" ]]; then
     TG_NAME="$BOT_NAME"
     [[ "$SETUP_FEISHU" == "true" ]] && TG_NAME="${BOT_NAME}-telegram"
     TELEGRAM_BOTS_JSON=$(node -e "
-      console.log(JSON.stringify([{
+      const engine = process.argv[4];
+      const bot = {
         name: process.argv[1],
         telegramBotToken: process.argv[2],
-        defaultWorkingDirectory: process.argv[3]
-      }], null, 2))
-    " "$TG_NAME" "$TELEGRAM_BOT_TOKEN" "$WORK_DIR")
+        defaultWorkingDirectory: process.argv[3],
+      };
+      if (engine === 'kimi') { bot.engine = 'kimi'; bot.kimi = { thinking: true }; }
+      if (engine === 'codex') { bot.engine = 'codex'; bot.codex = { approvalPolicy: 'never', sandbox: 'workspace-write' }; }
+      console.log(JSON.stringify([bot], null, 2))
+    " "$TG_NAME" "$TELEGRAM_BOT_TOKEN" "$WORK_DIR" "${BOT_ENGINE:-claude}")
   fi
 
   if [[ "$SETUP_WECHAT" == "true" ]]; then
@@ -526,11 +717,15 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     # Append suffix if other platforms are also configured
     [[ "$SETUP_FEISHU" == "true" || "$SETUP_TELEGRAM" == "true" ]] && WX_NAME="${BOT_NAME}-wechat"
     WECHAT_BOTS_JSON=$(node -e "
-      console.log(JSON.stringify([{
+      const engine = process.argv[3];
+      const bot = {
         name: process.argv[1],
-        defaultWorkingDirectory: process.argv[2]
-      }], null, 2))
-    " "$WX_NAME" "$WORK_DIR")
+        defaultWorkingDirectory: process.argv[2],
+      };
+      if (engine === 'kimi') { bot.engine = 'kimi'; bot.kimi = { thinking: true }; }
+      if (engine === 'codex') { bot.engine = 'codex'; bot.codex = { approvalPolicy: 'never', sandbox: 'workspace-write' }; }
+      console.log(JSON.stringify([bot], null, 2))
+    " "$WX_NAME" "$WORK_DIR" "${BOT_ENGINE:-claude}")
   fi
 
   node -e "
@@ -561,14 +756,25 @@ step "Phase 6: Installing skills and setting up workspace"
 SKILLS_DIR="$HOME/.claude/skills"
 mkdir -p "$SKILLS_DIR"
 
-# Install metaskill (bundled in src/skills/metaskill/)
-info "Installing metaskill skill..."
-mkdir -p "$SKILLS_DIR/metaskill/flows"
-cp "$METABOT_HOME/src/skills/metaskill/SKILL.md" "$SKILLS_DIR/metaskill/SKILL.md"
-cp "$METABOT_HOME/src/skills/metaskill/flows/team.md" "$SKILLS_DIR/metaskill/flows/team.md"
-cp "$METABOT_HOME/src/skills/metaskill/flows/agent.md" "$SKILLS_DIR/metaskill/flows/agent.md"
-cp "$METABOT_HOME/src/skills/metaskill/flows/skill.md" "$SKILLS_DIR/metaskill/flows/skill.md"
-success "metaskill skill installed → $SKILLS_DIR/metaskill"
+# Sanity check: bundled skill tree must exist in the checked-out repo.
+# If it's missing, the user's checkout is stale (predates the skill bundling
+# commits) — fail with a clear message instead of cryptic cp errors.
+SKILL_SENTINEL="$METABOT_HOME/src/skills/metabot/SKILL.md"
+if [[ ! -f "$SKILL_SENTINEL" ]]; then
+  error "Bundled skill source not found at: $SKILL_SENTINEL"
+  error "Your $METABOT_HOME checkout appears to be stale or incomplete."
+  error "Try: cd $METABOT_HOME && git fetch origin && git reset --hard origin/main"
+  error "(WARNING: 'git reset --hard' discards uncommitted local changes.)"
+  exit 1
+fi
+
+# Clean up legacy metaskill skill if present — no longer installed by default.
+# Users who still want the agent-team generator can copy it back from
+# $METABOT_HOME/src/skills/metaskill/ (the source files remain bundled in the repo).
+if [[ -d "$SKILLS_DIR/metaskill" ]]; then
+  rm -rf "$SKILLS_DIR/metaskill"
+  info "Removed legacy metaskill skill from $SKILLS_DIR (now opt-in — see src/skills/metaskill/)"
+fi
 
 # Install metamemory skill (bundled in src/memory/skill/)
 info "Installing metamemory skill..."
@@ -695,8 +901,12 @@ fi
 if [[ -n "${DEPLOY_WORK_DIR:-}" ]]; then
   SKILLS_DEST="$DEPLOY_WORK_DIR/.claude/skills"
 
-  # Copy skills (common + lark-cli skills if Feishu)
-  DEPLOY_SKILLS="metaskill metamemory metabot voice skill-hub"
+  # Copy skills (common + lark-cli skills if Feishu).
+  # metaskill (agent-team generator) and metaschedule (persistent server-side
+  # scheduler) are no longer installed by default — copy them from
+  # $METABOT_HOME/src/skills/ if you want them. CC native CronCreate / /loop
+  # already cover ad-hoc, session-scoped scheduling.
+  DEPLOY_SKILLS="metamemory metabot voice skill-hub"
   if [[ "$SETUP_LARK_CLI" == "true" ]]; then
     for lark_skill in lark-base lark-calendar lark-contact lark-doc lark-drive lark-event lark-im lark-mail lark-minutes lark-openapi-explorer lark-shared lark-sheets lark-skill-maker lark-task lark-vc lark-whiteboard lark-wiki lark-workflow-meeting-summary lark-workflow-standup-report; do
       [[ -d "$SKILLS_DIR/$lark_skill" ]] && DEPLOY_SKILLS="$DEPLOY_SKILLS $lark_skill"
@@ -710,10 +920,16 @@ if [[ -n "${DEPLOY_WORK_DIR:-}" ]]; then
     fi
   done
 
-  # Deploy CLAUDE.md to working directory
+  # Deploy CLAUDE.md to working directory (+ AGENTS.md symlink for Kimi engine)
   if [[ -f "$METABOT_HOME/src/workspace/CLAUDE.md" ]]; then
     cp "$METABOT_HOME/src/workspace/CLAUDE.md" "$DEPLOY_WORK_DIR/CLAUDE.md"
     success "Deployed CLAUDE.md → $DEPLOY_WORK_DIR/CLAUDE.md"
+    # Kimi engine reads AGENTS.md not CLAUDE.md — symlink so both engines see the same doc
+    if [[ ! -e "$DEPLOY_WORK_DIR/AGENTS.md" ]]; then
+      (cd "$DEPLOY_WORK_DIR" && ln -s CLAUDE.md AGENTS.md 2>/dev/null) \
+        && success "Linked AGENTS.md → CLAUDE.md (for Kimi engine compatibility)" \
+        || warn "Could not create AGENTS.md symlink"
+    fi
   fi
 else
   warn "Could not determine working directory, skipping workspace deployment"
@@ -939,6 +1155,24 @@ if ! echo "$PATH" | grep -q "$LOCAL_BIN"; then
 fi
 success "mm/mb/metabot CLI tools installed to $LOCAL_BIN"
 
+# Persist METABOT_HOME for non-default install paths so the CLI tools
+# (mm/mb/metabot) can find the install in new shell sessions. The CLIs all
+# fall back to $HOME/metabot, so we only need to export when it differs.
+if [[ "$METABOT_HOME" != "$DEFAULT_METABOT_HOME" ]]; then
+  for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+    [[ -f "$rc_file" ]] || continue
+    # Drop any prior export to keep this idempotent across re-runs.
+    if grep -q '^export METABOT_HOME=' "$rc_file" 2>/dev/null; then
+      sed_i '/^export METABOT_HOME=/d' "$rc_file"
+    fi
+  done
+  echo "export METABOT_HOME=\"$METABOT_HOME\"" >> "$HOME/.bashrc"
+  if [[ -f "$HOME/.zshrc" ]]; then
+    echo "export METABOT_HOME=\"$METABOT_HOME\"" >> "$HOME/.zshrc"
+  fi
+  info "Persisted METABOT_HOME=$METABOT_HOME to shell rc files"
+fi
+
 # ============================================================================
 # Phase 8: Build + Start MetaBot with PM2
 # ============================================================================
@@ -1017,6 +1251,7 @@ if [[ "${SKIP_CONFIG}" == "false" ]]; then
   echo -e "  ${BOLD}Working Dir:${NC}    ${WORK_DIR}"
   echo -e "  ${BOLD}API:${NC}            http://localhost:${API_PORT}"
   echo -e "  ${BOLD}API Secret:${NC}     ${API_SECRET:0:8}...${API_SECRET: -4}"
+  echo -e "  ${BOLD}Engine:${NC}         ${BOT_ENGINE:-claude}"
   echo -e "  ${BOLD}Auth Method:${NC}    ${CLAUDE_AUTH_METHOD}"
   if [[ "${CLAUDE_AUTH_METHOD}" == "third_party" ]]; then
     echo -e "  ${BOLD}Provider:${NC}       ${PROVIDER_NAME}"
@@ -1040,6 +1275,18 @@ if [[ "${SKIP_CONFIG}" == "false" ]]; then
   STEP_NUM=1
   if [[ "${CLAUDE_AUTH_METHOD}" == "subscription" ]]; then
     echo "    ${STEP_NUM}. Run 'claude login' in a separate terminal"
+    STEP_NUM=$((STEP_NUM + 1))
+  fi
+  if [[ "${CLAUDE_AUTH_METHOD}" == "kimi" ]]; then
+    echo "    ${STEP_NUM}. Run 'kimi login' in a separate terminal (https://kimi.com to sign up)"
+    STEP_NUM=$((STEP_NUM + 1))
+  fi
+  if [[ "${CLAUDE_AUTH_METHOD}" == "codex" ]]; then
+    if ! command -v codex &>/dev/null; then
+      echo "    ${STEP_NUM}. Install Codex CLI: sudo npm install -g @openai/codex"
+      STEP_NUM=$((STEP_NUM + 1))
+    fi
+    echo "    ${STEP_NUM}. Run 'codex login' in a separate terminal (or set OPENAI_API_KEY / configure ~/.codex/config.toml)"
     STEP_NUM=$((STEP_NUM + 1))
   fi
   if [[ "$SETUP_FEISHU" == "true" ]]; then
